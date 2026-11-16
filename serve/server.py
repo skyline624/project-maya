@@ -6882,7 +6882,10 @@ def tee_server_log(path: str) -> None:
     sys.stdout = ServerLogTee(sys.stdout, handle)
 
 
-def main() -> int:
+on_service_ready = None                                 # serveur-ia patch: optional callback(svc), called once the Service is ready
+
+
+def main(argv=None) -> int:                             # serveur-ia patch: argv (default sys.argv, as before)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "maya", "strata"], default="mock")   # (strata: the old name, kept for older scripts)
     ap.add_argument("--config", help="maya engine config (JSON: exe, args, cwd, tokenizer, model_name), "
@@ -6916,7 +6919,7 @@ def main() -> int:
                     help="stdin is a pipe from the program that started this server (maya.py), open while it runs: "
                          "when it closes - that program ended, however it ended - the server stops as on Ctrl+C "
                          "(on Linux also when its parent process ends)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)                             # serveur-ia patch: (argv)
     if a.engine == "strata":
         a.engine = "maya"
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
@@ -7127,6 +7130,8 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    if on_service_ready is not None:                    # serveur-ia patch: hands the running Service to serve/grpc_adapter.py
+        on_service_ready(svc)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, /v1/responses, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
