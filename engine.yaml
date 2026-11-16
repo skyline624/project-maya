@@ -1,0 +1,47 @@
+# Maya (GLM-5.3-Flash, Maya-S24 IQ2_XXS_S) behind the gRPC adapter serve/grpc_adapter.py. Needs both cards.
+# Install once (v1.1.56 ships no venv; the package list is Maya's own PY_PACKAGES in setup.py):
+#   python3 -m venv .venv && .venv/bin/pip install numpy jinja2 regex pyyaml tqdm requests pillow psutil "jsonschema>=4.18,<5" -e ../../../../engines/python-sdk
+# The binary build/maya comes from phase 5.2; the pack under {dataDir}/maya-s24/pack is made from the GGUF files by
+# Maya's own tools. Revision = head of "main" on 2026-11-16 (the files match the hashes in maya.py).
+# Profile "game": same engine with a smaller context and 6 GiB of VRAM kept free (not yet measured on the reference host).
+id: maya
+module: llm
+version: 1.1.56
+runtime:
+  kind: python-venv
+  command:
+    - "{engineDir}/.venv/bin/python"
+    - "-m"
+    - "serve.grpc_adapter"
+    - "--socket"
+    - "{socket}"
+    - "--config"
+    - "{engineDir}/config/maya-s24.json"
+    - "--models-dir"
+    - "{modelsDir}"
+    - "--data-dir"
+    - "{dataDir}"
+  workingDir: "{engineDir}"
+  env:
+    # One CPU reserve for both GPUs (bench 2026-10-29: 22.1 tok/s against 21.2).
+    STRATA_GLM_CPU_SHARED: "1"
+requirements:
+  gpus: { min: 2, max: 2 }
+  vramMibPerGpu: 22000
+  hostRamMib: 90112
+  minComputeCapability: "8.6"
+  startupTimeoutSeconds: 900
+profiles:
+  normal:
+    args: []
+  game:
+    args: ["--config", "{engineDir}/config/maya-s24.game.json"]
+models:
+  - id: glm-5.3-flash
+    repo: peasantsmith/GLM-5.3-Flash-Maya-GGUF
+    revision: 5ca1df1d2436bd1ab270b169c5ea6c47aad23641
+    license: { id: mit, url: "https://opensource.org/license/mit" }
+    files:
+      - { path: Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf, bytes: 46886573024, sha256: 8ebd5c74bcf65ece2a8699b7b6fd2b8d177f350ed252cee252fdd99b86a0138c }
+      - { path: Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf, bytes: 46982144736, sha256: 4bd445da3a0128a9c5b32228c924e0a622aa4a132c7a8dc9a2c207a4beea8e34 }
+      - { path: Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00003-of-00003.gguf, bytes: 832958464, sha256: a6fd4e88007ac49b431c7d02be34e43ab7a09224d53a0c52782327613cb41917 }

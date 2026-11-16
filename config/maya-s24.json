@@ -1,0 +1,17 @@
+{
+  "exe": "{engineDir}/build/maya",
+  "args": [
+    "--glm-pack",
+    "{dataDir}/maya-s24/pack",
+    "--max-context",
+    "262144"
+  ],
+  "cwd": "{engineDir}",
+  "tokenizer": "{dataDir}/maya-s24/pack/tokenizer",
+  "model_name": "glm-5.3-flash",
+  "log": "{dataDir}/logs/maya.log",
+  "gpu": [
+    0,
+    1
+  ]
+}

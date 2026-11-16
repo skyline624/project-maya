@@ -9,13 +9,15 @@ Needs the SDK in the same environment: `pip install -e engines/python-sdk`.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # run as `python serve/grpc_adapter.py` too
 
 from serveur_ia_engine import (EngineNotReady, LlmBridge, StateTracker, free_port, openai_request,  # noqa: E402
-                               poll_vram, run_hosted, with_prompt_tokens)
+                               poll_vram, render_config, run_hosted, with_prompt_tokens)
 from serveur_ia_engine.llm_bridge import vram_from_telemetry  # noqa: E402
 from serveur_ia_engine.proto.llm.v1 import llm_pb2  # noqa: E402
 
@@ -69,7 +71,9 @@ def main(argv=None) -> int:
     ap.add_argument("--socket", required=True)
     ap.add_argument("--engine-id", default=None)
     ap.add_argument("--profile", default=None)   # informational: the profile's args are already in --config
-    ap.add_argument("--config")
+    ap.add_argument("--config", help="JSON config template; {engineDir} {modelsDir} {dataDir} are expanded")
+    ap.add_argument("--models-dir", default="")
+    ap.add_argument("--data-dir", default=None)
     a, rest = ap.parse_known_args(argv)
 
     state, bridge = StateTracker(), MayaBridge()
@@ -87,7 +91,10 @@ def main(argv=None) -> int:
     if "--engine" not in rest:
         args += ["--engine", "maya"]
     if a.config:
-        args += ["--config", a.config]
+        data = a.data_dir or tempfile.mkdtemp(prefix="serveur-ia-")
+        values = {"engineDir": str(Path(__file__).resolve().parents[1]), "modelsDir": a.models_dir, "dataDir": data}
+        rendered = Path(data) / "config" / f"{a.engine_id or "maya"}.json"
+        args += ["--config", render_config(a.config, str(rendered), values, os.environ.get("CUDA_VISIBLE_DEVICES"))]
     return run_hosted(lambda: server.main(args + rest), socket_path=a.socket, engine_id=a.engine_id,
                       version=server.MAYA_VERSION or "unknown", bridge=bridge, state=state)
 
