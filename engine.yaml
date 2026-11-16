@@ -30,7 +30,8 @@ requirements:
   vramMibPerGpu: 22900   # measured on 2x RTX 3090, normal profile (game: about 18300)
   hostRamMib: 65536   # measured: 61 GB of RAM lost on the host (the process maps about 65 GB)
   minComputeCapability: "8.6"
-  startupTimeoutSeconds: 600   # measured 126-131 s with the files in the page cache
+  startupTimeoutSeconds: 1200  # 126-131 s warm, 553 s seen cold on 2026-11-16 (under investigation)
+  idleTimeoutSeconds: 0        # stay loaded; another engine needing the GPUs still evicts it
 profiles:
   normal:
     args: []
