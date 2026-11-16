@@ -1,9 +1,9 @@
 # Maya (GLM-5.3-Flash, Maya-S24 IQ2_XXS_S) behind the gRPC adapter serve/grpc_adapter.py. Needs both cards.
-# Install once (v1.1.56 ships no venv; the package list is Maya's own PY_PACKAGES in setup.py):
-#   python3 -m venv .venv && .venv/bin/pip install numpy jinja2 regex pyyaml tqdm requests pillow psutil "jsonschema>=4.18,<5" -e ../../../../engines/python-sdk
-# The binary build/maya comes from phase 5.2; the pack under {dataDir}/maya-s24/pack is made from the GGUF files by
+# Install once (v1.1.56 ships no venv; requirements.txt is Maya's own PY_PACKAGES, pinned):
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -e ../../../../engines/python-sdk
+# The binary build/maya comes from scripts/build.sh (README.serveur-ia.md); the pack under {dataDir}/maya-s24/pack is made from the GGUF files by
 # Maya's own tools. Revision = head of "main" on 2026-11-16 (the files match the hashes in maya.py).
-# Profile "game": same engine with a smaller context and 6 GiB of VRAM kept free (not yet measured on the reference host).
+# Profile "game": same engine with a 65536-token context and 6 GiB of VRAM kept free (measured: about 18.3 GB per card).
 id: maya
 module: llm
 version: 1.1.56
@@ -27,10 +27,10 @@ runtime:
     STRATA_GLM_CPU_SHARED: "1"
 requirements:
   gpus: { min: 2, max: 2 }
-  vramMibPerGpu: 22000
-  hostRamMib: 90112
+  vramMibPerGpu: 22900   # measured on 2x RTX 3090, normal profile (game: about 18300)
+  hostRamMib: 65536   # measured: 61 GB of RAM lost on the host (the process maps about 65 GB)
   minComputeCapability: "8.6"
-  startupTimeoutSeconds: 900
+  startupTimeoutSeconds: 600   # measured 126-131 s with the files in the page cache
 profiles:
   normal:
     args: []

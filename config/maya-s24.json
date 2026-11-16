@@ -4,7 +4,19 @@
     "--glm-pack",
     "{dataDir}/maya-s24/pack",
     "--max-context",
-    "262144"
+    "262144",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "auto",
+    "--kv-streaming",
+    "on",
+    "--expert-profile",
+    "{engineDir}/data/expert-profile-glm.bin",
+    "--vram-reserve-mib",
+    "1536",
+    "--kv-resident",
+    "32768"
   ],
   "cwd": "{engineDir}",
   "tokenizer": "{dataDir}/maya-s24/pack/tokenizer",
@@ -13,5 +25,13 @@
   "gpu": [
     0,
     1
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "reasoning_effort": "high",
+  "lib_dirs": [
+    "{engineDir}/build"
   ]
 }
