@@ -26,6 +26,13 @@
     0,
     1
   ],
+  "vision": {
+    "exe": "{engineDir}/build/maya-vision",
+    "mmproj": "{modelsDir}/glm-5.3-flash/vision/mmproj-GLM-5.3-Flash-F16.gguf",
+    "model": "{modelsDir}/glm-5.3-flash/vision/GLM-5.3-Flash-vocab.gguf",
+    "gpu": true,
+    "max_tokens": 1024
+  },
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95

@@ -1,7 +1,7 @@
 # Maya (GLM-5.3-Flash, Maya-S24 IQ2_XXS_S) behind the gRPC adapter serve/grpc_adapter.py. Needs both cards.
 # Install once (v1.1.56 ships no venv; requirements.txt is Maya's own PY_PACKAGES, pinned):
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -e ../../../../engines/python-sdk
-# The binary build/maya comes from scripts/build.sh (README.serveur-ia.md); the pack under {dataDir}/maya-s24/pack is made from the GGUF files by
+# The binaries build/maya and build/maya-vision (images) come from scripts/build.sh (README.serveur-ia.md); the pack under {dataDir}/maya-s24/pack is made from the GGUF files by
 # Maya's own tools. Revision = head of "main" on 2026-11-16 (the files match the hashes in maya.py).
 # Profile "game": same engine with a 65536-token context and 6 GiB of VRAM kept free (measured: about 18.3 GB per card).
 id: maya
@@ -46,3 +46,5 @@ models:
       - { path: Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf, bytes: 46886573024, sha256: 8ebd5c74bcf65ece2a8699b7b6fd2b8d177f350ed252cee252fdd99b86a0138c }
       - { path: Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf, bytes: 46982144736, sha256: 4bd445da3a0128a9c5b32228c924e0a622aa4a132c7a8dc9a2c207a4beea8e34 }
       - { path: Maya-S24/GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00003-of-00003.gguf, bytes: 832958464, sha256: a6fd4e88007ac49b431c7d02be34e43ab7a09224d53a0c52782327613cb41917 }
+      - { path: vision/mmproj-GLM-5.3-Flash-F16.gguf, bytes: 1128046944, sha256: 3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882 }
+      - { path: vision/GLM-5.3-Flash-vocab.gguf, bytes: 9426880, sha256: 8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912 }

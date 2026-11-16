@@ -1,6 +1,7 @@
 #!/bin/sh
-# Compile Maya (targets maya and maya-ds4) for the RTX 3090 (sm_86) in the maya-toolchain:cuda13-nvtx image (CUDA 13.0,
-# NVTX headers). Output: <engineDir>/build/{maya,maya-ds4,libcublas*.so.13,libcudart.so.13}.
+# Compile Maya (targets maya and maya-ds4) and maya-vision (images: llama.cpp mtmd + the glm5next vision tower) for the
+# RTX 3090 (sm_86) in the maya-toolchain:cuda13-nvtx image (CUDA 13.0, NVTX headers).
+# Output: <engineDir>/build/{maya,maya-ds4,maya-vision,libcublas*.so.13,libcudart.so.13}.
 # Options as /mnt/donnees/maya/compiler-v1.1.56.sh. Env: IMAGE, CPUS (12), MEMORY (48g), ARCH (86), VENV (host cmake).
 # Needs docker and python3 on the host and network access (llama.cpp source, once).
 set -eu
@@ -28,6 +29,9 @@ shutil.rmtree(tmp)
 PY
 fi
 
+# glm5next vision tower into mtmd (idempotent; the ggml-cuda edits are #ifdef MAYA_VISION_F32_SUMS, the engine ignores them).
+python3 "$ENGINE/tools/vision/glm5next_patch.py" "$LLAMA"
+
 mkdir -p "$ENGINE/build"
 docker run --rm --cpus "$CPUS" --memory "$MEMORY" --pids-limit 4096 --user "$(id -u):$(id -g)" \
   -e HOME=/tmp/build-home -e ARCH="$ARCH" -e CMAKE="$CMAKE" -e ENGINE="$ENGINE" -e JOBS="$CPUS" \
@@ -37,7 +41,10 @@ docker run --rm --cpus "$CPUS" --memory "$MEMORY" --pids-limit 4096 --user "$(id
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
     -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 -DSTRATA_GGML_DIR="$ENGINE/third_party/llama.cpp"
   "$CMAKE" --build build --target maya-ds4 maya -j "$JOBS"
+  "$CMAKE" -G Ninja -S tools/vision -B build/_vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$ENGINE/third_party/llama.cpp"     -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$ARCH -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc     -DCUDAToolkit_ROOT=/usr/local/cuda-13.0
+  "$CMAKE" --build build/_vision --target maya-vision -j "$JOBS"
+  cp build/_vision/bin/maya-vision build/maya-vision
   # CUDA runtime libraries the host does not have (the driver supplies libcuda only).
   for l in libcublas.so.13 libcublasLt.so.13 libcudart.so.13; do cp -L /usr/local/cuda/lib64/$l build/; done
 '
-echo "built: $ENGINE/build/maya $ENGINE/build/maya-ds4"
+echo "built: $ENGINE/build/maya $ENGINE/build/maya-ds4 $ENGINE/build/maya-vision"
