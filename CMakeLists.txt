@@ -684,6 +684,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(maya PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(maya PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
+  # Drama 3 (Fish Audio TTS; docs/plan-drama3-maya.md): its own engine (src/drama), built by name only (tools/drama/build.sh)
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+    find_package(Threads REQUIRED)
+    add_executable(maya-drama EXCLUDE_FROM_ALL src/drama/drama_main.cpp src/drama/drama_model.cu)
+    target_include_directories(maya-drama PRIVATE ${_strata_gpu_include_directories})
+    target_compile_options(maya-drama PRIVATE $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Xcompiler=-Wall,-Wextra>)
+    target_link_libraries(maya-drama PRIVATE strata_artifact ${_strata_gpu_runtime_target} Threads::Threads)
+    set_target_properties(maya-drama PROPERTIES BUILD_RPATH "$ORIGIN")   # libcudart.so.13 copied next to it by the build script
+  endif()
+
   # DeepSeek-V4.1-Flash (EXL3, tools/ds4/pack.py; or a GGUF, tools/ds4/pack_gguf.py): its own engine over the kernel
   # libraries (src/ds4)
   # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
