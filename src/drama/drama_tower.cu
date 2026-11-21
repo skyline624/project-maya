@@ -228,6 +228,34 @@ TowerRunner::~TowerRunner() = default;
 int TowerRunner::pos() const { return m_->pos; }
 void TowerRunner::reset() { m_->pos = 0; }
 
+// K then V of every layer, rows [0, pos)
+bool TowerRunner::save(DeviceSnapshot& snap, std::string& err) {
+    Impl& s = *m_;
+    snap.clear();
+    snap.pos = s.pos;
+    if (!s.mem) { err = "init() not called"; return false; }
+    CK(cudaSetDevice(s.dev));
+    CK(cudaStreamSynchronize(s.st));
+    const size_t kvl = (size_t) s.ctx * kNKV * kHd, rows = (size_t) s.pos * kNKV * kHd * 4;
+    for (int il = 0; il < s.g.t_layers; ++il)
+        if (!snap.add(s.dev, s.kc + il * kvl, rows, err) || !snap.add(s.dev, s.vc + il * kvl, rows, err)) return false;
+    return true;
+}
+
+bool TowerRunner::restore(const DeviceSnapshot& snap, std::string& err) {
+    Impl& s = *m_;
+    if (!s.mem) { err = "init() not called"; return false; }
+    if (snap.pos > s.ctx) { err = "tower snapshot of " + std::to_string(snap.pos) + " rows does not fit the context of " + std::to_string(s.ctx); return false; }
+    CK(cudaSetDevice(s.dev));
+    CK(cudaStreamSynchronize(s.st));
+    const size_t kvl = (size_t) s.ctx * kNKV * kHd, rows = (size_t) snap.pos * kNKV * kHd * 4;
+    size_t i = 0;
+    for (int il = 0; il < s.g.t_layers; ++il)
+        if (!snap.get(i++, s.kc + il * kvl, rows, err) || !snap.get(i++, s.vc + il * kvl, rows, err)) return false;
+    s.pos = snap.pos;
+    return true;
+}
+
 bool TowerRunner::init(int ctx, const TowerSampling& sampling, std::string& err) {
     Impl& s = *m_;
     const DramaGeometry& g = s.g;

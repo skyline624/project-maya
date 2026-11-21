@@ -5,6 +5,7 @@
 // GPUs by layer.  No forward pass yet.  Device pointers are `const void*` so this header needs no CUDA include.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -72,6 +73,22 @@ struct DramaHead { // last part: output_norm and the lm_head cut to rows [eos, s
     int dev = 0;
     DTensor output_norm, lm_head;
     std::vector<int> ids; // vocab id of each lm_head row
+};
+
+// Copy of a runner's state kept in device memory, next to the live one (the prefix cache of a voice, docs/plan-drama3-maya.md 9.3).  The runner that
+// fills it (DramaRunner::save, TowerRunner::save) adds its blobs in a fixed order and reads them back in the same order.
+struct DeviceSnapshot {
+    struct Blob { int dev; void* p; size_t bytes; };
+    std::vector<Blob> blobs;
+    int pos = 0; // the runner's position when saved
+    DeviceSnapshot() = default;
+    DeviceSnapshot(const DeviceSnapshot&) = delete;
+    DeviceSnapshot& operator=(const DeviceSnapshot&) = delete;
+    ~DeviceSnapshot() { clear(); }
+    void clear();
+    size_t bytes() const;
+    bool add(int dev, const void* src, size_t bytes, std::string& err);  // copies `bytes` of device memory on `dev` into a new blob
+    bool get(size_t i, void* dst, size_t bytes, std::string& err) const; // copies blob i back (`bytes` must be its size)
 };
 
 class DramaModel {

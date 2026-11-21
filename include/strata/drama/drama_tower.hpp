@@ -46,6 +46,8 @@ public:
     bool init(int ctx, const TowerSampling& sampling, std::string& err); // KV cache of `ctx` rows per layer
     void reset();                                                          // position 0 (the KV cache needs no clearing)
     int pos() const;
+    bool save(DeviceSnapshot& snap, std::string& err);                     // the KV rows below pos() and pos (prefix cache, as DramaRunner::save)
+    bool restore(const DeviceSnapshot& snap, std::string& err);
     bool step(const TowerStep& in, std::string& err);                      // runs one row at pos(), then pos()++
     std::vector<std::string> report() const;
 

@@ -6,6 +6,11 @@
 //   drama_ref generate  --model bb.gguf --mmproj mm.gguf --prompt TEXT --seed S [--frames N] --codes-out g.codes --wav-out g.wav
 //                       [--rows-out g.rows] [--gpu]                                                             (P3 reference)
 //   make-rows also takes --codes-out x.codes.
+// Voice cloning (J4): make-rows and generate take --ref-wav ref.wav --ref-text TRANSCRIPT, the target text being --prompt: the prompt is llama.cpp's cloned one
+// (reference-bracket-v1, drama3_gen_audio_pipeline::build_reference_prompt): head tokens, one embedding row per frame of the clip (the speaker encoder's output
+// rows), tail tokens.  make-rows --codes-out and generate --ref-codes-out write the clip's 10 codes per frame row (rows order); generate --rows-out holds the
+// prompt rows then the generated frames' rows; generate --check-prompt captures the embeddings (`model.input_embed`) of the text rows llama.cpp's own
+// pipeline decodes and compares them with the token rows of the prompt built here.  A text argument that starts with @ is read from that file.
 // Formats (little-endian): .rows = "DRR1" u32 n_rows u32 n_embd, per row i32 tok (tok == -1: n_embd f32 follow);
 //                          .out  = "DRO1" u32 n_rows u32 n_embd u32 n_out(4097), per row n_embd f32 h + n_out f32 logits,
 //                          .codes = "DRC1" u32 n_frames u32 n_cb(10), per frame i32 c0 (semantic index, not a token id), c1..c9,
@@ -23,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <random>
 #include <string>
@@ -132,6 +138,12 @@ static std::vector<int32_t> tokenize(const llama_vocab * vocab, const std::strin
     return ids;
 }
 
+static std::string slurp(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) die("cannot read " + path);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
 static std::map<std::string, std::string> parse_args(int argc, char ** argv, int from) {
     std::map<std::string, std::string> a;
     for (int i = from; i < argc; i++) {
@@ -141,8 +153,98 @@ static std::map<std::string, std::string> parse_args(int argc, char ** argv, int
         if (k == "gpu") { a[k] = "1"; continue; }
         if (i + 1 >= argc) die("missing value for --" + k);
         a[k] = argv[++i];
+        if (!a[k].empty() && a[k][0] == '@') a[k] = slurp(a[k].substr(1));
     }
     return a;
+}
+
+// ---- voice cloning: the reference clip's rows and codes, and the cloned prompt (mtmd-helper-gen.cpp, drama3_gen_audio_pipeline)
+
+// offset of the leading speaker tag <|speaker:N|> after optional whitespace, npos without one
+static size_t speaker_tag_pos(const std::string & text) {
+    const size_t lead = text.find_first_not_of(" \t\n\r\f\v");
+    static const std::string open = "<|speaker:";
+    if (lead == std::string::npos || text.compare(lead, open.size(), open) != 0) return std::string::npos;
+    size_t i = lead + open.size();
+    const size_t digits = i;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') i++;
+    return i > digits && text.compare(i, 2, "|>") == 0 ? lead : std::string::npos;
+}
+
+// each segment tokenized alone, as tokenize_segments() does
+static void tokenize_segments(const llama_vocab * vocab, const std::vector<std::string> & segs, std::vector<Row> & rows) {
+    for (const std::string & seg : segs) for (int32_t t : tokenize(vocab, seg)) rows.push_back({ t, {} });
+}
+
+struct RefClip { std::vector<float> rows; std::vector<int32_t> codes; size_t n_frames = 0; };  // rows: n_frames * n_embd; codes: n_frames * N_CB
+
+// the clip through the speaker encoder as encode_speaker() does (rows = the encoder's output), and its codes as mtmd_gen_state_set_ref() keeps them
+static RefClip encode_ref(mtmd_context * mctx, mtmd_bitmap * bmp, uint32_t n_embd) {
+    const std::string marker = mtmd_get_marker(mctx);
+    mtmd_input_text text{ marker.c_str(), marker.size(), false, true };
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    const mtmd_bitmap * bp = bmp;
+    if (mtmd_tokenize(mctx, chunks, &text, &bp, 1) != 0) die("tokenize of the reference clip failed");
+    const mtmd_input_chunk * audio = nullptr;
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks) && !audio; i++) {
+        const mtmd_input_chunk * c = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(c) == MTMD_INPUT_CHUNK_TYPE_AUDIO) audio = c;
+    }
+    if (!audio) die("no audio chunk");
+    if (mtmd_encode_chunk(mctx, audio) != 0) die("speaker encode failed");
+    RefClip clip;
+    clip.n_frames = mtmd_input_chunk_get_n_tokens(audio);
+    const float * e = mtmd_get_output_embd(mctx);
+    clip.rows.assign(e, e + clip.n_frames * n_embd);
+    mtmd_gen_state * st = mtmd_gen_state_init(mctx, mtmd_gen_state_params_default());
+    size_t n_codes = 0;
+    if (!st || mtmd_gen_state_set_ref(mctx, st) != 0) die("the encoder gave no reference codes");
+    const int32_t * codes = mtmd_gen_state_get_ref_codes(st, &n_codes);
+    if (!codes || n_codes != clip.n_frames * N_CB) die("reference codes: " + std::to_string(n_codes) + " for " + std::to_string(clip.n_frames) + " frames");
+    clip.codes.assign(codes, codes + n_codes);
+    mtmd_gen_state_free(st);
+    mtmd_input_chunks_free(chunks);
+    return clip;
+}
+
+// reference-bracket-v1 with one reference (build_reference_prompt): the speaker tag follows "Text: " directly (default speaker 0), an untagged target reuses it
+static std::vector<Row> clone_prompt_rows(const llama_vocab * vocab, std::string text, std::string ref_text, const RefClip & clip, uint32_t n_embd) {
+    std::string tag = "<|speaker:0|>";
+    const size_t lead = speaker_tag_pos(ref_text);
+    if (lead == std::string::npos) {
+        ref_text = tag + " " + ref_text;
+    } else {
+        ref_text = ref_text.substr(lead);
+        tag = ref_text.substr(0, ref_text.find("|>") + 2);
+    }
+    if (speaker_tag_pos(text) == std::string::npos) text = tag + " " + text;
+    std::vector<Row> rows;
+    tokenize_segments(vocab, { "<|im_start|>system\n", "convert the provided text to speech reference to the following:", "\n\n[Reference 1]\nText: " + ref_text + "\nSpeech: " }, rows);
+    for (size_t f = 0; f < clip.n_frames; f++) {
+        Row r; r.tok = -1; r.embd.assign(clip.rows.begin() + (long) (f * n_embd), clip.rows.begin() + (long) ((f + 1) * n_embd));
+        rows.push_back(std::move(r));
+    }
+    tokenize_segments(vocab, { "<|im_end|>\n", "<|im_start|>user\n", text, "<|im_end|>\n", "<|im_start|>assistant\n<|voice|>" }, rows);
+    return rows;
+}
+
+// max abs difference between the clip's rows and (E_lm[c0] + E_cb1[c1]) / sqrt(2) of its codes
+static float rows_vs_codes(const std::string & mmproj, uint32_t n_embd, const RefClip & clip) {
+    const size_t d = n_embd, tab = d * N_SEM * 2;
+    const std::vector<float> e_lm  = read_bf16(mmproj, "a.gen.code.out_embd.weight", tab, 0, d * N_SEM);
+    const std::vector<float> e_cb1 = read_bf16(mmproj, "a.gen.code.embd.weight", tab * 10, tab, d * N_SEM);
+    float worst = 0.0f;
+    for (size_t f = 0; f < clip.n_frames; f++) {
+        const int32_t * c = &clip.codes[f * N_CB];
+        for (size_t j = 0; j < d; j++) worst = std::max(worst, fabsf(clip.rows[f * d + j] - (e_lm[(size_t) c[0] * d + j] + e_cb1[(size_t) c[1] * d + j]) / sqrtf(2.0f)));
+    }
+    return worst;
+}
+
+static std::vector<std::vector<int32_t>> frames_of(const RefClip & clip) {
+    std::vector<std::vector<int32_t>> fr;
+    for (size_t f = 0; f < clip.n_frames; f++) fr.emplace_back(clip.codes.begin() + (long) (f * N_CB), clip.codes.begin() + (long) ((f + 1) * N_CB));
+    return fr;
 }
 
 static int make_rows(std::map<std::string, std::string> & a) {
@@ -156,6 +258,28 @@ static int make_rows(std::map<std::string, std::string> & a) {
     const uint32_t n_embd = gguf_n_embd(a["model"]);
     fprintf(stderr, "vocab %d tokens, n_embd %u, add_bos %d\n", llama_vocab_n_tokens(vocab), n_embd, (int) llama_vocab_get_add_bos(vocab));
     // the helper never adds BOS for Drama 3 (add_special = false): the rows start with <|im_start|>
+    if (a.count("ref-wav")) {  // llama.cpp's cloned prompt: the clip goes through the speaker encoder (the codec side of the mmproj, no text model)
+        if (!a.count("ref-text") || a.count("codes") || a.count("suffix")) die("--ref-wav needs --ref-text, and excludes --codes and --suffix");
+        mtmd_context_params p = mtmd_context_params_default();
+        p.use_gpu = a.count("gpu") > 0;
+        p.n_threads = 12;
+        p.warmup = false;
+        p.print_timings = false;
+        mtmd_context * mctx = mtmd_init_from_file(a["mmproj"].c_str(), nullptr, p);
+        if (!mctx || mtmd_gen_audio_get_info(mctx).type != MTMD_GEN_AUDIO_TYPE_DRAMA3 || !mtmd_support_audio(mctx)) die("cannot load a Drama 3 speaker encoder from " + a["mmproj"]);
+        mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_file(mctx, a["ref-wav"].c_str(), false, mtmd_helper_init_opt_default());
+        if (!w.bitmap) die("cannot read the audio file " + a["ref-wav"]);
+        const RefClip clip = encode_ref(mctx, w.bitmap, n_embd);
+        const std::vector<Row> rows = clone_prompt_rows(vocab, a["prompt"], a["ref-text"], clip, n_embd);
+        write_rows(a["out"], rows, n_embd);
+        if (a.count("codes-out")) write_codes(a["codes-out"], frames_of(clip));
+        fprintf(stderr, "wrote %zu rows (%zu reference frames, %.2f s of audio) to %s; frame rows vs (E_lm[c0] + E_cb1[c1]) / sqrt(2): max abs diff %.3g\n", rows.size(), clip.n_frames,
+                (double) clip.n_frames * 2048.0 / mtmd_gen_audio_get_info(mctx).sample_rate, a["out"].c_str(), rows_vs_codes(a["mmproj"], n_embd, clip));
+        mtmd_bitmap_free(w.bitmap);
+        mtmd_free(mctx);
+        llama_model_free(model);
+        return 0;
+    }
     std::vector<Row> rows;
     for (int32_t t : tokenize(vocab, a["prompt"])) rows.push_back({ t, {} });
     const size_t n_prompt = rows.size();
@@ -192,6 +316,18 @@ static int make_rows(std::map<std::string, std::string> & a) {
 struct Backbone { llama_model * model = nullptr; llama_context * ctx = nullptr; uint32_t n_embd = 0; bool mrope = false; };
 
 // backbone model + context as run() always did; n_rows sizes the context. n_embd_rows != 0 is checked against the model.
+static std::vector<float> g_h;   // generate --check-prompt: the token embeddings (`model.input_embed`, the get_rows of token_embd) of every text ubatch, in order
+static bool g_h_on = false;
+static bool h_cb(ggml_tensor * t, bool ask, void *) {
+    if (strcmp(t->name, "model.input_embed") != 0) return !ask;
+    if (ask) return g_h_on;
+    if (t->type != GGML_TYPE_F32) die("model.input_embed is not f32");
+    const size_t at = g_h.size(), nb = ggml_nbytes(t);
+    g_h.resize(at + nb / 4);
+    ggml_backend_tensor_get(t, g_h.data() + at, 0, nb);
+    return true;
+}
+
 static Backbone load_backbone(std::map<std::string, std::string> & a, int n_rows, uint32_t n_embd_rows) {
     const bool gpu = a.count("gpu") > 0;
     llama_backend_init();
@@ -219,6 +355,7 @@ static Backbone load_backbone(std::map<std::string, std::string> & a, int n_rows
     cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
     cp.n_threads = cp.n_threads_batch = a.count("threads") ? atoi(a["threads"].c_str()) : 12;
     if (!gpu) { cp.offload_kqv = false; cp.op_offload = false; }
+    if (a.count("check-prompt")) cp.cb_eval = h_cb;
     b.ctx = llama_init_from_model(b.model, cp);
     if (!b.ctx) die("cannot create context");
     // as the server does for TTS slots: `h` (result_norm) is returned next to the logits, pooling NONE gives one row per output
@@ -469,9 +606,18 @@ static std::vector<std::string> prompt_segments(std::string text) {  // drama3_g
 // next-row embeddings are not exposed by the API: they are read from out_codes and gen_audio_out with the cb_eval.
 static int generate(std::map<std::string, std::string> & a) {
     for (const char * k : { "model", "mmproj", "prompt", "seed", "codes-out", "wav-out" }) if (!a.count(k)) die(std::string("missing --") + k);
-    const bool gpu = a.count("gpu") > 0;
+    const bool gpu = a.count("gpu") > 0, clone = a.count("ref-wav") > 0;
+    if (clone && !a.count("ref-text")) die("--ref-wav needs --ref-text");
     Backbone b = load_backbone(a, 4096, 0);
     mtmd_context * mctx = init_mtmd(a["mmproj"], b.model, gpu);
+    RefClip clip;
+    mtmd_helper_bitmap_wrapper wav{};
+    if (clone) {  // my own encode of the clip first: its rows and codes, since the pipeline keeps its codes to itself
+        wav = mtmd_helper_bitmap_init_from_file(mctx, a["ref-wav"].c_str(), false, mtmd_helper_init_opt_default());
+        if (!wav.bitmap) die("cannot read the audio file " + a["ref-wav"]);
+        clip = encode_ref(mctx, wav.bitmap, b.n_embd);
+        fprintf(stderr, "reference: %zu frames; frame rows vs (E_lm[c0] + E_cb1[c1]) / sqrt(2): max abs diff %.3g\n", clip.n_frames, rows_vs_codes(a["mmproj"], b.n_embd, clip));
+    }
     mtmd_helper::gen_audio gen;
     gen.init(b.ctx, mctx);
     if (!gen.valid()) die("the context cannot run the audio generation");
@@ -483,7 +629,20 @@ static int generate(std::map<std::string, std::string> & a) {
     inp.top_p = 0.95f;
     inp.seed = (uint32_t) atoll(a["seed"].c_str());
     inp.out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+    if (clone) {
+        inp.speaker_ref = wav.bitmap;
+        inp.speaker_ref_text = a["ref-text"].c_str();
+    }
     if (gen.set_input(&inp) != 0) die("set_input failed");
+    if (clone) {  // the pipeline encoded the clip again in set_input: its rows are still the context's output buffer
+        const float * pe = mtmd_get_output_embd(mctx);
+        const size_t n = clip.rows.size();
+        float worst = 0.0f;
+        for (size_t i = 0; i < n; i++) worst = std::max(worst, fabsf(pe[i] - clip.rows[i]));
+        fprintf(stderr, "the pipeline's reference rows vs the encode above: max abs diff %.3g\n", worst);
+        clip.rows.assign(pe, pe + n);
+    }
+    g_h_on = a.count("check-prompt") > 0;
 
     g_cap.want_count = true;  // one tower row per prompt row but the last
     const auto t0 = std::chrono::steady_clock::now();
@@ -493,12 +652,14 @@ static int generate(std::map<std::string, std::string> & a) {
         if (ret == 0) break;
     }
     g_cap.want_count = false;
+    g_h_on = false;
     const int n_prompt_tower = g_cap.n_count;
     const auto t1 = std::chrono::steady_clock::now();
 
     std::vector<Row> rows;
     const llama_vocab * vocab = llama_model_get_vocab(b.model);
-    for (const std::string & seg : prompt_segments(a["prompt"])) for (int32_t t : tokenize(vocab, seg)) rows.push_back({ t, {} });
+    if (clone) rows = clone_prompt_rows(vocab, a["prompt"], a["ref-text"], clip, b.n_embd);
+    else for (const std::string & seg : prompt_segments(a["prompt"])) for (int32_t t : tokenize(vocab, seg)) rows.push_back({ t, {} });
     if ((int) rows.size() - 1 != n_prompt_tower)
         die("tokenization mismatch: " + std::to_string(rows.size()) + " prompt tokens here, tower ran on " + std::to_string(n_prompt_tower) + " rows");
     const size_t n_prompt = rows.size();
@@ -533,12 +694,33 @@ static int generate(std::map<std::string, std::string> & a) {
     w.write(data, (std::streamsize) data_len);
     w.close();
     write_codes(a["codes-out"], frames);
+    if (clone && a.count("ref-codes-out")) write_codes(a["ref-codes-out"], frames_of(clip));
+    if (a.count("check-prompt")) {  // the rows the pipeline fed the backbone vs the prompt built here: text rows by their token embedding, speech rows as they are
+        const size_t d = b.n_embd, n_tok = [&] { size_t n = 0; for (size_t r = 0; r < n_prompt; r++) n += rows[r].tok >= 0; return n; }();
+        const size_t got = g_h.size() / d;
+        const bool all = false;  // embedding batches feed the graph a leaf tensor the callback never sees: the reference rows are checked by the count and make-rows' own check
+        fprintf(stderr, "check-prompt: llama.cpp's pipeline embedded %zu text rows (%zu text + %zu reference rows in the prompt built here)\n", got, n_tok, n_prompt - n_tok);
+        if (got != n_tok) die("check-prompt: unexpected number of captured rows");
+        const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(b.model));
+        double worst = 0; size_t bad = 0, k = 0;
+        for (size_t r = 0; r < n_prompt; r++) {
+            if (rows[r].tok < 0 && !all) continue;
+            const std::vector<float> e = rows[r].tok >= 0 ? read_bf16(a["model"], "token_embd.weight", n_vocab * d * 2, (size_t) rows[r].tok * d * 2, d) : rows[r].embd;
+            double m = 0;
+            for (size_t j = 0; j < d; j++) m = std::max(m, (double) fabsf(e[j] - g_h[k * d + j]));
+            worst = std::max(worst, m);
+            bad += m > 1e-6;
+            k++;
+        }
+        fprintf(stderr, "check-prompt: %zu rows compared, max abs difference %.3g, %zu rows differ: %s\n", k, worst, bad, bad ? "MISMATCH" : "IDENTICAL");
+    }
     if (a.count("rows-out")) write_rows(a["rows-out"], rows, b.n_embd);
     const auto s = [](auto x, auto y) { return std::chrono::duration<double>(y - x).count(); };
     fprintf(stderr, "prompt %zu rows (%.1f s), %d frames (%.1f s, %s), %s: %.2f s of audio at %d Hz (%lld samples), %zu bytes of wav\n",
             n_prompt, s(t0, t1), n_frames, s(t1, t2), stop ? "stopped by EOS" : "frame limit", gpu ? "GPU" : "CPU",
             sample_rate > 0 ? (double) n_samples / sample_rate : 0.0, sample_rate, (long long) n_samples, data_len);
     gen.ctx.reset();
+    if (clone) mtmd_bitmap_free(wav.bitmap);
     mtmd_free(mctx);
     llama_free(b.ctx);
     llama_model_free(b.model);

@@ -240,6 +240,40 @@ bool upload_part(int dev, uint8_t* base, const std::vector<std::tuple<uint64_t, 
 
 } // namespace
 
+void DeviceSnapshot::clear() {
+    for (auto& b : blobs) {
+        cudaSetDevice(b.dev);
+        cudaFree(b.p);
+    }
+    blobs.clear();
+    pos = 0;
+}
+
+size_t DeviceSnapshot::bytes() const {
+    size_t n = 0;
+    for (const auto& b : blobs) n += b.bytes;
+    return n;
+}
+
+bool DeviceSnapshot::add(int dev, const void* src, size_t bytes, std::string& err) {
+    void* p = nullptr;
+    cudaError_t e = cudaSetDevice(dev);
+    if (e == cudaSuccess && (e = cudaMalloc(&p, std::max<size_t>(bytes, 1))) == cudaSuccess) {
+        blobs.push_back({dev, p, bytes}); // owned from here on: clear() frees it even if the copy fails
+        if (bytes) e = cudaMemcpy(p, src, bytes, cudaMemcpyDeviceToDevice);
+    }
+    if (e != cudaSuccess) err = std::string("snapshot: ") + cudaGetErrorString(e);
+    return e == cudaSuccess;
+}
+
+bool DeviceSnapshot::get(size_t i, void* dst, size_t bytes, std::string& err) const {
+    if (i >= blobs.size() || blobs[i].bytes != bytes) { err = "snapshot: blob " + std::to_string(i) + " does not fit"; return false; }
+    cudaError_t e = cudaSetDevice(blobs[i].dev);
+    if (e == cudaSuccess && bytes) e = cudaMemcpy(dst, blobs[i].p, bytes, cudaMemcpyDeviceToDevice);
+    if (e != cudaSuccess) err = std::string("snapshot: ") + cudaGetErrorString(e);
+    return e == cudaSuccess;
+}
+
 bool DramaModel::load(const std::string& backbone_path, const std::string& mmproj_path, std::vector<int> devs, std::vector<int> bounds, std::string& err) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();

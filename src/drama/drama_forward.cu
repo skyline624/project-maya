@@ -155,6 +155,41 @@ void DramaRunner::reset() {
     for (auto& P : s.parts) { cudaSetDevice(P.dev); cudaDeviceSynchronize(); }
 }
 
+// Per layer in order: GDN S then conv, or the K then V rows [0, pos).  Everything ran on the parts' streams, which step() leaves synchronized.
+bool DramaRunner::save(DeviceSnapshot& snap, std::string& err) {
+    Impl& s = *m_;
+    snap.clear();
+    snap.pos = s.pos;
+    if (s.parts.empty()) { err = "init() not called"; return false; }
+    const size_t sb = (size_t) s.g.ssm_heads * 128 * 128 * 4, cb = (size_t) s.g.conv_dim() * (size_t) (s.g.ssm_conv - 1) * 4;
+    const size_t kv = (size_t) s.pos * s.g.n_head_kv * s.g.head_dim * 4;
+    for (auto& P : s.parts) { CK(cudaSetDevice(P.dev)); CK(cudaStreamSynchronize(P.st)); }
+    for (int il = 0; il < s.g.n_layer; ++il) {
+        const Impl::LState& st = s.ls[(size_t) il];
+        const int dev = s.m.layers()[(size_t) il].dev;
+        if (st.S) { if (!snap.add(dev, st.S, sb, err) || !snap.add(dev, st.conv, cb, err)) return false; }
+        else if (!snap.add(dev, st.K, kv, err) || !snap.add(dev, st.V, kv, err)) return false;
+    }
+    return true;
+}
+
+bool DramaRunner::restore(const DeviceSnapshot& snap, std::string& err) {
+    Impl& s = *m_;
+    if (s.parts.empty()) { err = "init() not called"; return false; }
+    if (snap.pos > s.ctx) { err = "snapshot of " + std::to_string(snap.pos) + " rows does not fit the context of " + std::to_string(s.ctx); return false; }
+    const size_t sb = (size_t) s.g.ssm_heads * 128 * 128 * 4, cb = (size_t) s.g.conv_dim() * (size_t) (s.g.ssm_conv - 1) * 4;
+    const size_t kv = (size_t) snap.pos * s.g.n_head_kv * s.g.head_dim * 4;
+    for (auto& P : s.parts) { CK(cudaSetDevice(P.dev)); CK(cudaStreamSynchronize(P.st)); }
+    size_t i = 0;
+    for (int il = 0; il < s.g.n_layer; ++il) {
+        const Impl::LState& st = s.ls[(size_t) il];
+        if (st.S) { if (!snap.get(i++, st.S, sb, err) || !snap.get(i++, st.conv, cb, err)) return false; }
+        else if (!snap.get(i++, st.K, kv, err) || !snap.get(i++, st.V, kv, err)) return false;
+    }
+    s.pos = snap.pos;
+    return true;
+}
+
 // ---------------------------------------------------------------- layers
 
 void DramaRunner::Impl::gdn(int il, const DramaLayer& L, Part& P) {

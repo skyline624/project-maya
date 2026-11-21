@@ -26,6 +26,11 @@ public:
     int pos() const;
     int n_out() const; // logits per row (the lm_head rows)
 
+    // the prefix cache: copies the recurrent states and the KV rows below pos() into `snap` (device memory), and puts them back (position included).
+    // Rows past the saved position are overwritten by the next steps, as after reset().
+    bool save(DeviceSnapshot& snap, std::string& err);
+    bool restore(const DeviceSnapshot& snap, std::string& err);
+
     // runs one row at position pos(), then pos()++.  tok >= 0: a token id; else `emb` (n_embd floats).
     // h (n_embd, after output_norm) and logits (n_out) go to host buffers; either may be null.
     bool step(int tok, const float* emb, float* h, float* logits, std::string& err);
