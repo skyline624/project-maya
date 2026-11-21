@@ -56,7 +56,8 @@ struct DramaLayer {
     DTensor attn_norm, post_norm;                                        // F32 [n_embd]
     DTensor gate_inp;                                                    // F32 [n_embd, n_expert]
     DTensor shexp_gate, shexp_up, shexp_down, shexp_inp;                 // BF16; shexp_inp F32 [n_embd, 1]
-    DTensor exps_gate, exps_up, exps_down;                               // Q8_0, fused over the experts
+    DTensor exps_gate, exps_up, exps_down;                               // Q8_0, fused over the experts (p null when load() skipped the upload: the expert pool owns them)
+    const uint8_t* exps_src[3] = {nullptr, nullptr, nullptr};            // gate, up, down in the host mmap, always set
     DTensor qkv, gate, alpha, beta, a, dt_bias, conv1d, ssm_norm, ssm_out; // GDN
     DTensor q, k, v, o, q_norm, k_norm;                                  // full attention (q holds q and gate per head)
 };
@@ -98,9 +99,10 @@ public:
     DramaModel(const DramaModel&) = delete;
     DramaModel& operator=(const DramaModel&) = delete;
 
-    // devs: one CUDA device per part; bounds: first layer of each later part (empty with 2+ devs: an even split)
+    // devs: one CUDA device per part; bounds: first layer of each later part (empty with 2+ devs: an even split).
+    // upload_experts false (J5): the expert tensors stay in the mmap (DramaLayer::exps_src) and the ExpertPool of the runner brings them to the devices.
     bool load(const std::string& backbone_path, const std::string& mmproj_path, std::vector<int> devs,
-              std::vector<int> bounds, std::string& err);
+              std::vector<int> bounds, std::string& err, bool upload_experts = true);
     // first and last 4 KiB of every uploaded tensor, and of one random expert's slices per layer, read back and memcmp'd
     bool verify(std::string& err);
     std::vector<std::string> report() const; // VRAM by category per device, load time

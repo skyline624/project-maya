@@ -6,6 +6,7 @@
 //   maya-drama --dump  --model <backbone.gguf> --mmproj <mmproj.gguf> --rows in.rows --out out.out [--ctx 4096] [--devs 0,1] [--layer-split 20]
 //   maya-drama --generate --model .. --mmproj .. --rows prompt.rows [--codes ref.codes] --codes-out g.codes [--max-frames 1500] [--seed 1] [--sampling official|llama]
 //   maya-drama --generate --model .. --mmproj .. --texts list.txt [--repeat K] --prefix-rows N --codes ref.codes --codes-out g%d.codes [--check-prefix]
+//   (J5, every mode but --check/--tower-dump) [--expert-vram-mib N] [--vram-reserve-mib N] [--expert-profile f] [--expert-profile-save f] [--expert-prefetch 0|1]
 //   maya-drama --tower-dump --model .. --mmproj .. --rows f.rows [--codes f.codes] --h-from f.out --out f.tower
 //   maya-drama --replay --model .. --mmproj .. --rows g.rows --codes g.codes [--ref-codes ref.codes] [--sampling llama]
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include "drama_sampling.hpp"
 #include "strata/drama/drama_forward.hpp"
 #include "strata/drama/drama_model.hpp"
+#include "strata/drama/drama_serve.hpp"
 #include "strata/drama/drama_tower.hpp"
 
 namespace {
@@ -53,6 +55,11 @@ int usage() {
               "  --ctx          rows of KV cache per attention layer (default 4096; --generate: prompt + max frames)\n"
               "  --devs         CUDA devices, one per part (default 0,1)\n"
               "  --layer-split  first layer of each later part, comma separated (default: an even split)\n"
+              "  --expert-vram-mib N       experts kept in VRAM per device (default: all that fit after the other allocations and --vram-reserve-mib); the rest stays in pinned RAM\n"
+              "  --vram-reserve-mib N      VRAM left free per device when --expert-vram-mib is not given (default 1536)\n"
+              "  --expert-profile f        usage counters of an earlier run: the initial fill takes the hottest experts, and the LFU starts from them\n"
+              "  --expert-profile-save f   write the usage counters of this run (reads the router's choice back at every layer, even when everything is resident)\n"
+              "  --expert-prefetch 0|1     copy the next layer's predicted experts ahead of time (default 1)\n"
               "  --verify       read back the first and last 4 KiB of every tensor (and of one expert per layer) and compare with the file");
     return 2;
 }
@@ -67,6 +74,26 @@ std::vector<int> ints(const std::string& s) {
 int fail(const std::string& why) {
     std::printf("ERROR %s\n", why.c_str());
     return 1;
+}
+
+ExpertOptions g_experts; // J5 options, set by main
+bool g_verify = false;
+
+// the pool of a runner, built after every other allocation on the devices
+bool setup_experts(DramaRunner& bb, std::string& err) {
+    if (!bb.init_experts(g_experts, err)) return false;
+    for (const auto& l : bb.pool_report()) std::printf("INFO %s\n", l.c_str());
+    return !g_verify || bb.verify_experts(err);
+}
+
+// the pool's counters over a stretch of work that took `ms` (0: unknown)
+void print_pool(const char* what, int text, const PoolStats& s, double ms) {
+    const uint64_t n = s.hits + s.misses;
+    const double rows = (double) std::max<uint64_t>(1, s.steps), mib = (double) s.bytes / (1 << 20);
+    std::printf("INFO text %d %s: experts hit %llu miss %llu (hit rate %.2f %%), prefetch %llu copies %llu used %llu skipped; %.1f MiB moved = %.2f MiB/row; read-back wait %.3f ms/row%s", text, what,
+                (unsigned long long) s.hits, (unsigned long long) s.misses, n ? 100.0 * (double) s.hits / (double) n : 100.0, (unsigned long long) s.pf_issued, (unsigned long long) s.pf_useful,
+                (unsigned long long) s.pf_skipped, mib, mib / rows, s.sync_ms / rows, ms > 0 ? "" : "\n");
+    if (ms > 0) std::printf("; %.2f GB/s average over the %.0f ms\n", (double) s.bytes / 1e9 / (ms * 1e-3), ms);
 }
 
 struct Row {
@@ -133,7 +160,7 @@ int dump(strata::drama::DramaModel& m, const std::string& rows_path, const std::
     std::string err;
     if (!read_rows(rows_path, (uint32_t) m.geometry().n_embd, rows, err)) return fail(err);
     strata::drama::DramaRunner r(m);
-    if (!r.init(ctx, err)) return fail(err);
+    if (!r.init(ctx, err) || !setup_experts(r, err)) return fail(err);
     r.reset();
     FILE* f = std::fopen(out_path.c_str(), "wb");
     if (!f) return fail("cannot write " + out_path);
@@ -316,7 +343,7 @@ int generate(DramaModel& m, const GenOpts& o) {
     const int ctx = o.ctx > 0 ? o.ctx : (int) longest + o.max_frames + 8;
     DramaRunner bb(m);
     TowerRunner tw(m);
-    if (!bb.init(ctx, err) || !tw.init(ctx, tower_sampling(o), err)) return fail(err);
+    if (!bb.init(ctx, err) || !tw.init(ctx, tower_sampling(o), err) || !setup_experts(bb, err)) return fail(err);
     for (const auto& l : bb.report()) std::printf("INFO %s\n", l.c_str());
     for (const auto& l : tw.report()) std::printf("INFO %s\n", l.c_str());
     std::vector<float> h((size_t) E), lg((size_t) bb.n_out());
@@ -352,10 +379,12 @@ int generate(DramaModel& m, const GenOpts& o) {
                                      (double) (snap_bb.bytes() + snap_tw.bytes()) / (1 << 20), n_prompt - N, t_tail);
         else std::printf("INFO text %d: prefill %zu rows = prefix restored in %.0f ms (instead of %zu rows) + the other %zu rows %.0f ms\n", i, n_prompt, t_restore, N, n_prompt - N, t_tail);
 
+        if (bb.has_pool()) print_pool("prefill", i, bb.expert_stats(true), 0);
         std::vector<int32_t> codes;
         GenStats st;
         Trace tr;
         if (!gen_frames(bb, tw, h, lg, o, ctx, o.max_frames, codes, st, o.check_prefix && N > 0 && i > 0 ? &tr : nullptr, err)) return fail(err);
+        if (bb.has_pool()) print_pool("generation", i, bb.expert_stats(true), st.t_total);
         const std::string path = out_path(o.codes_out, i);
         if (!write_codes(path, codes, err)) return fail(err);
         const double frame_s = 2048.0 / 44100.0, per = st.n ? st.t_total / (double) st.n : 0.0;
@@ -384,6 +413,8 @@ int generate(DramaModel& m, const GenOpts& o) {
             all_same = all_same && same;
         }
     }
+    if (!bb.save_expert_profile(err)) return fail(err);
+    for (const auto& l : bb.pool_report()) std::printf("INFO %s\n", l.c_str());
     return all_same ? 0 : fail("the prefix cache changed the logits");
 }
 
@@ -478,7 +509,7 @@ int replay(DramaModel& m, const GenOpts& o) {
     const int ctx = o.ctx > 0 ? o.ctx : (int) (n_prompt + F) + 8;
     DramaRunner bb(m);
     TowerRunner tw(m);
-    if (!bb.init(ctx, err) || !tw.init(ctx, tower_sampling(o), err)) return fail(err);
+    if (!bb.init(ctx, err) || !tw.init(ctx, tower_sampling(o), err) || !setup_experts(bb, err)) return fail(err);
     bb.reset();
     tw.reset();
     for (const auto& l : tw.report()) std::printf("INFO %s\n", l.c_str());
@@ -538,6 +569,7 @@ int replay(DramaModel& m, const GenOpts& o) {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (strata::drama::serve_requested(argc, argv)) return strata::drama::serve_main(argc, argv); // J6: the service, its own options
     bool check = false, verify = false, do_dump = false, do_gen = false, do_tdump = false, do_replay = false;
     int ctx = 4096;
     GenOpts go;
@@ -569,7 +601,12 @@ int main(int argc, char** argv) {
             go.llama = v == "llama";
         }
         else if (a == "--ctx") ctx = std::atoi(val());
-        else if (a == "--verify") verify = true;
+        else if (a == "--verify") verify = g_verify = true;
+        else if (a == "--expert-vram-mib") g_experts.vram_mib = std::atoll(val());
+        else if (a == "--vram-reserve-mib") g_experts.reserve_mib = std::atoll(val());
+        else if (a == "--expert-profile") g_experts.profile = val();
+        else if (a == "--expert-profile-save") g_experts.profile_save = val();
+        else if (a == "--expert-prefetch") g_experts.prefetch = std::atoi(val()) != 0;
         else if (a == "--model") model = val();
         else if (a == "--mmproj") mmproj = val();
         else if (a == "--devs") devs = ints(val());
@@ -589,7 +626,7 @@ int main(int argc, char** argv) {
 
     strata::drama::DramaModel m;
     std::string err;
-    if (!m.load(model, mmproj, devs, split, err)) return fail(err);
+    if (!m.load(model, mmproj, devs, split, err, check)) return fail(err); // only --check uploads the experts itself; the runners' pool owns them (J5)
     for (const auto& l : m.geometry().describe()) std::printf("INFO %s\n", l.c_str());
     if (verify && !m.verify(err)) return fail(err);
     for (const auto& l : m.report()) std::printf("INFO %s\n", l.c_str());

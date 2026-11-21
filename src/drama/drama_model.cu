@@ -274,7 +274,7 @@ bool DeviceSnapshot::get(size_t i, void* dst, size_t bytes, std::string& err) co
     return e == cudaSuccess;
 }
 
-bool DramaModel::load(const std::string& backbone_path, const std::string& mmproj_path, std::vector<int> devs, std::vector<int> bounds, std::string& err) {
+bool DramaModel::load(const std::string& backbone_path, const std::string& mmproj_path, std::vector<int> devs, std::vector<int> bounds, std::string& err, bool upload_experts) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
     Impl& m = *m_;
@@ -377,9 +377,14 @@ bool DramaModel::load(const std::string& backbone_path, const std::string& mmpro
             D("ffn_up_shexp.weight", kBF16, {E, FS}, L.shexp_up);
             D("ffn_down_shexp.weight", kBF16, {FS, E}, L.shexp_down);
             D("ffn_gate_inp_shexp.weight", kF32, {E, 1}, L.shexp_inp);
-            add(bb, part, kExperts, B("ffn_gate_exps.weight"), kQ8_0, {E, FE, NE}, L.exps_gate, g.n_expert);
-            add(bb, part, kExperts, B("ffn_up_exps.weight"), kQ8_0, {E, FE, NE}, L.exps_up, g.n_expert);
-            add(bb, part, kExperts, B("ffn_down_exps.weight"), kQ8_0, {FE, E, NE}, L.exps_down, g.n_expert);
+            const auto X3 = [&](const char* s, std::vector<uint64_t> shape, DTensor& dst, int k) {
+                if (upload_experts) add(bb, part, kExperts, B(s), kQ8_0, std::move(shape), dst, g.n_expert);
+                else dst.bytes = bytes_of(chk(bb, B(s), kQ8_0, std::move(shape)));
+                L.exps_src[k] = bb.tensor_data(*bb.find(B(s)));
+            };
+            X3("ffn_gate_exps.weight", {E, FE, NE}, L.exps_gate, 0);
+            X3("ffn_up_exps.weight", {E, FE, NE}, L.exps_up, 1);
+            X3("ffn_down_exps.weight", {FE, E, NE}, L.exps_down, 2);
             if (L.kind == LayerKind::Gdn) {
                 D("attn_qkv.weight", kBF16, {E, CONV}, L.qkv);
                 D("attn_gate.weight", kBF16, {E, INNER}, L.gate);

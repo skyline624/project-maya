@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 
 #include "drama_kernels.hpp"
@@ -40,7 +41,10 @@ struct DramaRunner::Impl {
         uint64_t bytes = 0;
         // scratch slices of `mem`
         float *x, *xn, *xb, *xq, *mix, *qkv, *z, *cv, *gout, *ab, *qfull, *kvec, *vvec, *qbuf, *aout, *rl, *wts, *act, *moe, *shg, *shu, *shact, *shout, *sg, *hfin, *logits;
-        int* ids;
+        int* ids;        // 2 * n_used: the router's expert ids, then the next layer's predicted ones
+        int* sids;       // n_used: the pool slot of each id
+        float *prl, *pwts, *pxn; // the prediction's router logits, weights (unused) and normalized input
+        int* ids_h = nullptr;    // pinned: ids (2 * n_used) and slots (n_used) on the host
     };
     struct LState { float *S = nullptr, *conv = nullptr, *K = nullptr, *V = nullptr; };
     std::vector<Part> parts;
@@ -49,6 +53,11 @@ struct DramaRunner::Impl {
     const char* dump_path = nullptr;   // DRAMA_DUMP_LAYERS=<file>: per row (first DRAMA_DUMP_ROWS, default 1) the input then the residual after each layer
     int dump_rows = 1;
     bool emu = false; // DRAMA_EMU=1: round the activations like the reference does
+    std::unique_ptr<ExpertPool> pool;
+    bool prefetch = false;
+    uint64_t nsteps = 0;
+    bool bad = false; // an error inside a layer: step() reports it
+    std::string bad_msg;
 
     explicit Impl(const DramaModel& model) : m(model), g(model.geometry()) {}
     ~Impl() {
@@ -57,6 +66,7 @@ struct DramaRunner::Impl {
         }
         for (auto& p : parts) {
             if (p.mem) { cudaSetDevice(p.dev); cudaFree(p.mem); }
+            if (p.ids_h) { cudaSetDevice(p.dev); cudaFreeHost(p.ids_h); }
             if (p.st) cudaStreamDestroy(p.st);
         }
     }
@@ -70,7 +80,7 @@ struct DramaRunner::Impl {
     void layer(int il, Part& P);
     void gdn(int il, const DramaLayer& L, Part& P);
     void attn(int il, const DramaLayer& L, Part& P);
-    void ffn(const DramaLayer& L, Part& P);
+    void ffn(int il, const DramaLayer& L, Part& P);
 };
 
 DramaRunner::DramaRunner(const DramaModel& model) : m_(new Impl(model)) {}
@@ -108,14 +118,15 @@ bool DramaRunner::init(int ctx, std::string& err) {
         const auto take = [&](uint64_t cnt) { const uint64_t o = n; n += (cnt + 63) / 64 * 64; return o; }; // 256-byte slices
         const uint64_t o_x = take(E), o_xn = take(E), o_xb = take(E), o_xq = take(E), o_mix = take(E), o_qkv = take(CONV), o_z = take(INNER), o_cv = take(CONV), o_gout = take(INNER), o_ab = take(2 * (uint64_t) g.ssm_heads),
                        o_qfull = take(NH * HD * 2), o_kvec = take(NKV * HD), o_vvec = take(NKV * HD), o_qbuf = take(NH * HD), o_aout = take(NH * HD), o_rl = take((uint64_t) g.n_expert),
-                       o_wts = take(NU), o_ids = take(NU), o_act = take(NU * FE), o_moe = take(E), o_shg = take(FS), o_shu = take(FS), o_shact = take(FS), o_shout = take(E), o_sg = take(1),
+                       o_wts = take(NU), o_ids = take(2 * NU), o_sids = take(NU), o_prl = take((uint64_t) g.n_expert), o_pwts = take(NU), o_pxn = take(E), o_act = take(NU * FE), o_moe = take(E), o_shg = take(FS), o_shu = take(FS), o_shact = take(FS), o_shout = take(E), o_sg = take(1),
                        o_h = take(E), o_lg = take(NOUT);
         P.bytes = n * 4;
+        CK(cudaHostAlloc((void**) &P.ids_h, 3 * NU * sizeof(int), cudaHostAllocDefault));
         CK(cudaMalloc((void**) &P.mem, P.bytes));
         float* b = P.mem;
         P.x = b + o_x; P.xn = b + o_xn; P.xb = b + o_xb; P.xq = b + o_xq; P.mix = b + o_mix; P.qkv = b + o_qkv; P.z = b + o_z; P.cv = b + o_cv; P.gout = b + o_gout; P.ab = b + o_ab;
         P.qfull = b + o_qfull; P.kvec = b + o_kvec; P.vvec = b + o_vvec; P.qbuf = b + o_qbuf; P.aout = b + o_aout; P.rl = b + o_rl; P.wts = b + o_wts;
-        P.ids = (int*) (b + o_ids); P.act = b + o_act; P.moe = b + o_moe; P.shg = b + o_shg; P.shu = b + o_shu; P.shact = b + o_shact; P.shout = b + o_shout;
+        P.ids = (int*) (b + o_ids); P.sids = (int*) (b + o_sids); P.prl = b + o_prl; P.pwts = b + o_pwts; P.pxn = b + o_pxn; P.act = b + o_act; P.moe = b + o_moe; P.shg = b + o_shg; P.shu = b + o_shu; P.shact = b + o_shact; P.shout = b + o_shout;
         P.sg = b + o_sg; P.hfin = b + o_h; P.logits = b + o_lg;
     }
     // per-layer state
@@ -221,17 +232,46 @@ void DramaRunner::Impl::attn(int il, const DramaLayer& L, Part& P) {
     k::gemv_bf16(s, L.o.p, bf16_in(P, P.aout, NH * HD, P.aout), P.mix, E, NH * HD);
 }
 
-void DramaRunner::Impl::ffn(const DramaLayer& L, Part& P) {
+void DramaRunner::Impl::ffn(int il, const DramaLayer& L, Part& P) {
     const cudaStream_t s = P.st;
     const int E = g.n_embd, NE = g.n_expert, NU = g.n_expert_used, FE = g.n_ff_exp, FS = g.n_ff_shexp;
     const size_t esz = (size_t) (L.exps_gate.bytes / (uint64_t) NE); // gate, up and down experts are all the same size
     k::gemv_f32(s, L.gate_inp.p, P.xn, P.rl, NE, E);
     k::router(s, P.rl, P.ids, P.wts, NE, NU);
+    // where the experts are: the layer's own tensors (J1 upload) or the pool's slots, which a miss fills first
+    const void *gate = L.exps_gate.p, *up = L.exps_up.p, *down = L.exps_down.p;
+    size_t stride = esz;
+    const int* ids = P.ids;
+    if (pool) {
+        const ExpertPool::View v = pool->view(il);
+        gate = v.gate; up = v.up; down = v.down; stride = v.stride;
+        if (!pool->direct(il) || pool->counting()) {
+            // the next layer's router on this hidden state guesses its experts: their copies overlap this layer's work
+            const bool pf = prefetch && il + 1 < g.n_layer && m.layers()[(size_t) il + 1].part == L.part && !pool->direct(il + 1);
+            if (pf) {
+                k::rmsnorm(s, P.x, F(m.layers()[(size_t) il + 1].post_norm), P.pxn, E, 1, g.rms_eps);
+                k::gemv_f32(s, m.layers()[(size_t) il + 1].gate_inp.p, P.pxn, P.prl, NE, E);
+                k::router(s, P.prl, P.ids + NU, P.pwts, NE, NU);
+            }
+            int* h = P.ids_h;
+            cudaMemcpyAsync(h, P.ids, (size_t) (pf ? 2 : 1) * (size_t) NU * sizeof(int), cudaMemcpyDeviceToHost, s);
+            const auto t0 = std::chrono::steady_clock::now();
+            cudaStreamSynchronize(s);
+            pool->note_sync(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            std::string e;
+            if (!pool->acquire(il, h, NU, h + 2 * NU, s, e)) { bad = true; bad_msg = e; return; }
+            if (pf) pool->prefetch(il + 1, h + NU, NU);
+            if (!pool->direct(il)) {
+                cudaMemcpyAsync(P.sids, h + 2 * NU, (size_t) NU * sizeof(int), cudaMemcpyHostToDevice, s);
+                ids = P.sids;
+            }
+        }
+    } else if (!gate) { bad = true; bad_msg = "no experts: init_experts() was not called and the model did not upload them"; return; }
     const float* xq = P.xn;
     if (emu) { k::round_q8(s, P.xn, P.xq, E); xq = P.xq; }
-    k::moe_gate_up(s, L.exps_gate.p, L.exps_up.p, esz, P.ids, xq, P.act, NU, FE, E / 32);
+    k::moe_gate_up(s, gate, up, stride, ids, xq, P.act, NU, FE, E / 32);
     if (emu) k::round_q8(s, P.act, P.act, NU * FE);
-    k::moe_down(s, L.exps_down.p, esz, P.ids, P.wts, P.act, P.moe, E, FE / 32, NU, FE);
+    k::moe_down(s, down, stride, ids, P.wts, P.act, P.moe, E, FE / 32, NU, FE);
     const float* xi = bf16_in(P, P.xn, E);
     k::gemv_bf16(s, L.shexp_gate.p, xi, P.shg, FS, E);
     k::gemv_bf16(s, L.shexp_up.p, xi, P.shu, FS, E);
@@ -249,7 +289,7 @@ void DramaRunner::Impl::layer(int il, Part& P) {
     if (L.kind == LayerKind::Gdn) gdn(il, L, P); else attn(il, L, P);
     k::add(s, P.x, P.mix, E);
     k::rmsnorm(s, P.x, F(L.post_norm), P.xn, E, 1, g.rms_eps);
-    ffn(L, P);
+    ffn(il, L, P);
 }
 
 bool DramaRunner::step(int tok, const float* emb, float* h_out, float* logits_out, std::string& err) {
@@ -291,6 +331,7 @@ bool DramaRunner::step(int tok, const float* emb, float* h_out, float* logits_ou
         }
         CK(cudaSetDevice(cur->dev));
         s.layer(il, *cur);
+        if (s.bad) { if (df) std::fclose(df); err = "layer " + std::to_string(il) + ": " + s.bad_msg; s.bad = false; return false; }
         dump_x(*cur);
     }
     if (df) std::fclose(df);
@@ -304,8 +345,29 @@ bool DramaRunner::step(int tok, const float* emb, float* h_out, float* logits_ou
     CK(cudaStreamSynchronize(cur->st));
     CK(cudaGetLastError());
     ++s.pos;
+    ++s.nsteps;
     return true;
 }
+
+bool DramaRunner::init_experts(const ExpertOptions& opt, std::string& err) {
+    Impl& s = *m_;
+    if (s.parts.empty()) { err = "init() not called"; return false; }
+    s.pool.reset(new ExpertPool(s.m));
+    s.prefetch = opt.prefetch;
+    if (!s.pool->init(opt, err)) { s.pool.reset(); return false; }
+    return true;
+}
+bool DramaRunner::has_pool() const { return (bool) m_->pool; }
+PoolStats DramaRunner::expert_stats(bool reset) {
+    Impl& s = *m_;
+    PoolStats st = s.pool ? s.pool->stats() : PoolStats();
+    st.steps = s.nsteps;
+    if (reset) { if (s.pool) s.pool->reset_stats(); s.nsteps = 0; }
+    return st;
+}
+bool DramaRunner::verify_experts(std::string& err) { return !m_->pool || m_->pool->verify(err); }
+bool DramaRunner::save_expert_profile(std::string& err) { return !m_->pool || m_->pool->save_profile(err); }
+std::vector<std::string> DramaRunner::pool_report() const { return m_->pool ? m_->pool->report() : std::vector<std::string>(); }
 
 std::vector<std::string> DramaRunner::report() const {
     const Impl& s = *m_;

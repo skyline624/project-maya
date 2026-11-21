@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "strata/drama/drama_model.hpp"
+#include "strata/drama/expert_pool.hpp"
 
 namespace strata::drama {
 
@@ -22,6 +23,14 @@ public:
 
     // allocates the scratch and the per-layer state on each layer's device: a KV cache of `ctx` rows per attention layer, the GDN matrices
     bool init(int ctx, std::string& err);
+    // J5: the experts come from an ExpertPool, built here after init() and after the other allocations on the devices (the default budget is what is free then).
+    // Needed before step() when the model was loaded with upload_experts == false.
+    bool init_experts(const ExpertOptions& opt, std::string& err);
+    bool has_pool() const;
+    PoolStats expert_stats(bool reset); // since the last reset
+    bool verify_experts(std::string& err);
+    bool save_expert_profile(std::string& err);
+    std::vector<std::string> pool_report() const;
     void reset(); // position 0, recurrent states zeroed (the KV cache needs no clearing: only rows < pos are read)
     int pos() const;
     int n_out() const; // logits per row (the lm_head rows)
