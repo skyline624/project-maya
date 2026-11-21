@@ -336,6 +336,7 @@ int serve_main(int argc, char** argv) {
     std::string model, mmproj, sampling = "official";
     std::vector<int> devs = {0, 1}, split;
     int ctx = 4096, cap = 4;
+    ExpertOptions xo; // J5 options, same as --generate
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto val = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -347,15 +348,20 @@ int serve_main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::atoi(val());
         else if (a == "--voices") cap = std::atoi(val());
         else if (a == "--sampling") sampling = val();
+        else if (a == "--expert-vram-mib") xo.vram_mib = std::atoll(val());
+        else if (a == "--vram-reserve-mib") xo.reserve_mib = std::atoll(val());
+        else if (a == "--expert-profile") xo.profile = val();
+        else if (a == "--expert-profile-save") xo.profile_save = val();
+        else if (a == "--expert-prefetch") xo.prefetch = std::atoi(val()) != 0;
         else { std::printf("ERROR unknown option %s\n", a.c_str()); return 2; }
     }
     if (model.empty() || mmproj.empty() || ctx < 64 || cap < 1 || (sampling != "official" && sampling != "llama")) {
-        std::puts("usage: maya-drama --serve --model <backbone.gguf> --mmproj <mmproj.gguf> [--devs 0,1] [--layer-split 20] [--ctx 4096] [--voices 4] [--sampling official|llama]");
+        std::puts("usage: maya-drama --serve --model <backbone.gguf> --mmproj <mmproj.gguf> [--devs 0,1] [--layer-split 20] [--ctx 4096] [--voices 4] [--sampling official|llama] [J5 expert options]");
         return 2;
     }
     DramaModel m;
     std::string err;
-    if (!m.load(model, mmproj, devs, split, err)) { std::printf("ERROR %s\n", err.c_str()); return 1; }
+    if (!m.load(model, mmproj, devs, split, err, false)) { std::printf("ERROR %s\n", err.c_str()); return 1; }
     for (const auto& l : m.report()) std::printf("INFO %s\n", l.c_str());
     Server s(m, sampling == "llama", ctx, cap);
     if (!s.init(err)) { std::printf("ERROR %s\n", err.c_str()); return 1; }
