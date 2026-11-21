@@ -6,7 +6,8 @@ POST /v1/audio/speech  {"input": text, "references": [{"audio_path": wav, "text"
 GET  /health
 
 Three processes: this one (HTTP, tokenizer, the Space's guards), `maya-drama --serve` (backbone + tower + sampling on the GPUs, see
-include/strata/drama/drama_serve.hpp) and `maya-drama-codec serve` (the llama.cpp DAC codec in docker, card 1).  Prompts are tokenized here, with a
+include/strata/drama/drama_serve.hpp) and `maya-drama-codec serve` (the llama.cpp DAC codec: in docker on card 1 by default, native with --codec-bin).
+`Service` is also what serve/drama_grpc.py (the serveur-ia Audio engine) drives.  Prompts are tokenized here, with a
 tokenizers BPE built from the backbone GGUF's own vocabulary (cached in the work dir); the engine turns the reference codes into embedding rows.
 Requests are served one at a time.  Python standard library + numpy + tokenizers (+ gguf, once, to build the tokenizer)."""
 import argparse
@@ -260,6 +261,15 @@ def read_wav(path):
         return np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").copy()
 
 
+def codec_native_env(codec_bin):
+    """Environment of a native codec: its libraries next to it, and the second card of CUDA_VISIBLE_DEVICES (the engine's tower and head live on it too:
+    the codec is small and the first card is the fuller one), or card 1 when the variable is not set."""
+    visible = [v.strip() for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
+    libs = str(Path(codec_bin).resolve().parent)
+    return {"CUDA_VISIBLE_DEVICES": visible[1] if len(visible) > 1 else visible[0] if visible else "1",
+            "LD_LIBRARY_PATH": libs + (":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else "")}
+
+
 # ---------------------------------------------------------------- service
 class Service:
     def __init__(self, a):
@@ -273,10 +283,20 @@ class Service:
         self.lock = threading.Lock()
         self.refs = {}  # sha256 of the wav -> (codes path, frames)
         self.n = 0
-        codec_cmd = a.codec_cmd.split() if a.codec_cmd else ["sh", str(ENGINE_DIR / "tools/drama/ref/run.sh"), "serve", "--mmproj", a.mmproj, "--gpu"]
+        if a.codec_bin:  # native: the libraries sit next to the binary; the card is the second one the process may see
+            codec_cmd, codec_env = [a.codec_bin, "serve", "--mmproj", a.mmproj, "--gpu"], codec_native_env(a.codec_bin)
+        elif a.codec_cmd:
+            codec_cmd, codec_env = a.codec_cmd.split(), {}
+        else:
+            codec_cmd = ["sh", str(ENGINE_DIR / "tools/drama/ref/run.sh"), "serve", "--mmproj", a.mmproj, "--gpu"]
+            codec_env = {"TOOL": "maya-drama-codec", "GPU": "1", "DEV": "1", "DOCKER_I": "1"}
         self.engine = Engine([a.engine_bin, "--serve", "--model", a.model, "--mmproj", a.mmproj, "--devs", a.devs, "--ctx", str(a.ctx), "--voices", str(a.voices),
                               "--sampling", a.sampling, *a.engine_arg], self.engine_log)
-        self.codec = Codec(codec_cmd, {"TOOL": "maya-drama-codec", "GPU": "1", "DEV": "1", "DOCKER_I": "1"} if not a.codec_cmd else {}, self.codec_log)
+        try:
+            self.codec = Codec(codec_cmd, codec_env, self.codec_log)
+        except BaseException:  # the engine holds both cards: do not leave it behind
+            self.engine.close()
+            raise
 
     def close(self):
         self.engine.close()
@@ -396,13 +416,14 @@ def handler(svc):
     return H
 
 
-def main():
+def make_parser():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     # the 14/10 revision, the one the official Space serves (the 29/10 one sounds slower and flatter)
     p.add_argument("--model", default=str(DRAMA / "gguf/drama3-1014-q8.gguf"))
     p.add_argument("--mmproj", default=str(DRAMA / "gguf/mmproj-drama3-1014-bf16.gguf"))
     p.add_argument("--engine-bin", default=str(ENGINE_DIR / "build-drama/maya-drama"))
     p.add_argument("--codec-cmd", help="command of `maya-drama-codec serve` (default: tools/drama/ref/run.sh in docker, GPU 1)")
+    p.add_argument("--codec-bin", help="native maya-drama-codec (tools/drama/codec/build.sh): run without docker on the second visible card, instead of --codec-cmd")
     p.add_argument("--work-dir", default=str(DRAMA / "parite/serve-work"), help="temporary files, reference codes, tokenizer, logs; must lie under drama-3/parite for the codec's container")
     p.add_argument("--tokenizer", help="tokenizer.json (default: built from the GGUF into the work dir)")
     p.add_argument("--host", default="127.0.0.1")
@@ -414,7 +435,11 @@ def main():
     p.add_argument("--sampling", default="official", choices=["official", "llama"])
     p.add_argument("--no-guards", action="store_true", help="the Space's guards off by default (a request can ask with \"guards\")")
     p.add_argument("--engine-arg", action="append", default=[], help="extra argument of maya-drama --serve")
-    a = p.parse_args()
+    return p
+
+
+def main():
+    a = make_parser().parse_args()
     svc = Service(a)
     httpd = ThreadingHTTPServer((a.host, a.port), handler(svc))
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=httpd.shutdown).start())
