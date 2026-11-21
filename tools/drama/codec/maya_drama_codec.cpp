@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -104,8 +105,9 @@ static int decode(std::map<std::string, std::string> & a) {
     return 0;
 }
 
-// reference wav -> codes file; returns the frames
-static size_t encode_file(mtmd_context * mctx, const std::string & wav, const std::string & out_path) {
+// reference wav -> codes file; returns the frames.  The CUDA speaker encoder can answer -1 for every codebook of a frame (argmax over NaN: clone1's frame 1, on the
+// GPU only; the CPU gives valid codes), which no tower can take as a reference frame: such a clip is encoded again with cpu(), the CPU context (made on first use).
+static size_t encode_file(mtmd_context * mctx, const std::string & wav, const std::string & out_path, const std::function<mtmd_context *()> & cpu = nullptr) {
     if (!mtmd_support_audio(mctx)) die("mmproj has no speaker encoder");
 
     mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_file(mctx, wav.c_str(), false, mtmd_helper_init_opt_default());
@@ -130,6 +132,14 @@ static size_t encode_file(mtmd_context * mctx, const std::string & wav, const st
     size_t n_codes = 0;
     const int32_t * codes = mtmd_gen_state_get_ref_codes(st, &n_codes);
     if (!codes || n_codes == 0 || n_codes % N_CB != 0) die("bad reference codes");
+    if (std::any_of(codes, codes + n_codes, [](int32_t c) { return c < 0; })) {
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(w.bitmap);
+        mtmd_gen_state_free(st);
+        if (!cpu) die("the speaker encoder gave negative codes for " + wav);
+        fprintf(stderr, "%s: negative reference codes on the GPU, encoding on the CPU\n", wav.c_str());
+        return encode_file(cpu(), wav, out_path);
+    }
 
     std::ofstream f(out_path, std::ios::binary);
     if (!f) die("cannot write " + out_path);
@@ -146,7 +156,9 @@ static size_t encode_file(mtmd_context * mctx, const std::string & wav, const st
 static int encode(std::map<std::string, std::string> & a) {
     for (const char * k : { "mmproj", "wav", "out" }) if (!a.count(k)) die(std::string("missing --") + k);
     mtmd_context * mctx = init_mtmd(a["mmproj"], a.count("gpu") > 0);
-    encode_file(mctx, a["wav"], a["out"]);
+    mtmd_context * cpu = nullptr;
+    encode_file(mctx, a["wav"], a["out"], a.count("gpu") ? [&] { return cpu ? cpu : (cpu = init_mtmd(a["mmproj"], false)); } : std::function<mtmd_context *()>());
+    if (cpu) mtmd_free(cpu);
     mtmd_free(mctx);
     return 0;
 }
@@ -154,6 +166,8 @@ static int encode(std::map<std::string, std::string> & a) {
 static int serve(std::map<std::string, std::string> & a) {
     if (!a.count("mmproj")) die("missing --mmproj");
     mtmd_context * mctx = init_mtmd(a["mmproj"], a.count("gpu") > 0);
+    mtmd_context * cpu = nullptr; // the encoder's CPU fallback, loaded when a clip needs it
+    const std::function<mtmd_context *()> cpu_ctx = [&] { return cpu ? cpu : (cpu = init_mtmd(a["mmproj"], false)); };
     printf("READY\n"); fflush(stdout);
     for (std::string line; std::getline(std::cin, line);) {
         std::istringstream is(line);
@@ -165,7 +179,7 @@ static int serve(std::map<std::string, std::string> & a) {
             const auto t0 = std::chrono::steady_clock::now();
             size_t n = 0;
             if (op == "decode" && !y.empty()) n = decode_file(mctx, x, y, z.empty() ? 64 : (size_t) std::max<long long>(1, atoll(z.c_str())));
-            else if (op == "encode" && !y.empty()) n = encode_file(mctx, x, y);
+            else if (op == "encode" && !y.empty()) n = encode_file(mctx, x, y, a.count("gpu") ? cpu_ctx : std::function<mtmd_context *()>());
             else die("expected: decode <in.codes> <out.wav> [chunk] | encode <ref.wav> <out.codes> | quit");
             printf("OK %.3f %zu\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), n);
         } catch (const std::exception & e) {
@@ -175,6 +189,7 @@ static int serve(std::map<std::string, std::string> & a) {
         }
         fflush(stdout);
     }
+    if (cpu) mtmd_free(cpu);
     mtmd_free(mctx);
     return 0;
 }
