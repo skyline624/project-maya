@@ -398,8 +398,9 @@ def handler(svc):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--model", default=str(DRAMA / "gguf/drama3-q8.gguf"))
-    p.add_argument("--mmproj", default=str(DRAMA / "gguf/mmproj-drama3-bf16.gguf"))
+    # the 14/10 revision, the one the official Space serves (the 29/10 one sounds slower and flatter)
+    p.add_argument("--model", default=str(DRAMA / "gguf/drama3-1014-q8.gguf"))
+    p.add_argument("--mmproj", default=str(DRAMA / "gguf/mmproj-drama3-1014-bf16.gguf"))
     p.add_argument("--engine-bin", default=str(ENGINE_DIR / "build-drama/maya-drama"))
     p.add_argument("--codec-cmd", help="command of `maya-drama-codec serve` (default: tools/drama/ref/run.sh in docker, GPU 1)")
     p.add_argument("--work-dir", default=str(DRAMA / "parite/serve-work"), help="temporary files, reference codes, tokenizer, logs; must lie under drama-3/parite for the codec's container")

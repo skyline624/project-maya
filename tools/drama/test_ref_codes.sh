@@ -11,7 +11,7 @@ mkdir -p "$W"
 bad=0
 for wav in "$@"; do
   cp "$wav" "$W/in.wav"
-  GPU=1 DEV=1 TOOL=maya-drama-codec sh $E/tools/drama/ref/run.sh encode --mmproj $D/gguf/mmproj-drama3-bf16.gguf --wav "$W/in.wav" --out "$W/out.codes" --gpu 2>&1 | grep -i "negative\|frames"
+  GPU=1 DEV=1 TOOL=maya-drama-codec sh $E/tools/drama/ref/run.sh encode --mmproj $D/gguf/mmproj-drama3-1014-bf16.gguf --wav "$W/in.wav" --out "$W/out.codes" --gpu 2>&1 | grep -i "negative\|frames"
   "$D/conv/bin/python" -I - "$W/out.codes" "$wav" <<'PYEOF' || bad=1
 import struct, sys
 b = open(sys.argv[1], "rb").read()
