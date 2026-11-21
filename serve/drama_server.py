@@ -134,6 +134,7 @@ class Child:
 
     def __init__(self, cmd, env, logfile, name, is_answer):
         self.name = name
+        self.log_name = logfile.name
         self.q = queue.Queue()
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=logfile, text=True, bufsize=1, env={**os.environ, **env})
         threading.Thread(target=self._read, args=(is_answer, logfile), daemon=True).start()
@@ -158,7 +159,7 @@ class Child:
         except queue.Empty:
             raise RuntimeError(f"{self.name}: no answer in {timeout} s") from None
         if a is None:
-            raise RuntimeError(f"{self.name} exited")
+            raise RuntimeError(f"{self.name} exited, see {self.log_name}")
         return a
 
     def close(self, quit_line):

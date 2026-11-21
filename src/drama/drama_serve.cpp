@@ -364,7 +364,8 @@ int serve_main(int argc, char** argv) {
     if (!m.load(model, mmproj, devs, split, err, false)) { std::printf("ERROR %s\n", err.c_str()); return 1; }
     for (const auto& l : m.report()) std::printf("INFO %s\n", l.c_str());
     Server s(m, sampling == "llama", ctx, cap);
-    if (!s.init(err)) { std::printf("ERROR %s\n", err.c_str()); return 1; }
+    if (!s.init(err) || !s.bb.init_experts(xo, err)) { std::printf("ERROR %s\n", err.c_str()); return 1; } // the pool last: it takes what the other allocations leave
+    for (const auto& l : s.bb.pool_report()) std::printf("INFO %s\n", l.c_str());
     for (const auto& l : s.bb.report()) std::printf("INFO %s\n", l.c_str());
     for (const auto& l : s.tw.report()) std::printf("INFO %s\n", l.c_str());
     reply(fmt("{\"event\":\"ready\",\"ctx\":%d,\"voices\":%d,\"sampling\":\"%s\"}", ctx, cap, sampling.c_str()));
